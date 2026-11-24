@@ -1,11 +1,4 @@
 import { createRequire } from 'node:module'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
-import {
-    CallToolResult,
-    CallToolResultSchema
-} from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { Context } from 'koishi'
 import { ChatLunaPlugin } from 'koishi-plugin-chatluna/services/chat'
@@ -33,6 +26,16 @@ const searchResult = z.object({
     )
 })
 
+interface JsonRpcResponse {
+    id?: number
+    error?: { message: string }
+    result?: {
+        isError?: boolean
+        content: { type: string; text?: string }[]
+        structuredContent?: unknown
+    }
+}
+
 class ParallelSearchProvider extends SearchProvider {
     name = 'parallel'
 
@@ -40,49 +43,72 @@ class ParallelSearchProvider extends SearchProvider {
         query: string,
         limit = this.config.topK
     ): Promise<SearchResult[]> {
-        const client = new Client({ name, version })
-        const transport = new StreamableHTTPClientTransport(
-            new URL('https://mcp.parallel.ai/mcp'),
+        // Parallel's MCP endpoint answers a single stateless JSON-RPC call,
+        // so no initialize handshake is needed.
+        const response = await this._plugin.fetch(
+            'https://mcp.parallel.ai/mcp',
             {
-                requestInit: {
+                method: 'POST',
+                redirect: 'error',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json, text/event-stream',
                     // Identify the plugin so Parallel can measure aggregate free MCP usage.
-                    headers: { 'User-Agent': `${name}/${version}` }
+                    'User-Agent': `${name}/${version}`
                 },
-                fetch: (url, init) =>
-                    this._plugin.fetch(url, {
-                        ...(init as Parameters<ChatLunaPlugin['fetch']>[1]),
-                        redirect: 'error'
-                    }) as unknown as ReturnType<FetchLike>
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'tools/call',
+                    params: {
+                        name: 'web_search',
+                        arguments: {
+                            objective: query,
+                            search_queries: [query]
+                        }
+                    }
+                })
             }
         )
 
-        try {
-            await client.connect(transport)
-            const result = (await client.callTool(
-                {
-                    name: 'web_search',
-                    arguments: { objective: query, search_queries: [query] }
-                },
-                CallToolResultSchema
-            )) as CallToolResult
+        const body = await response.text()
 
-            if (result.isError) {
-                throw new Error('Parallel web_search failed')
-            }
-
-            const text = result.content.find((block) => block.type === 'text')
-            const data = searchResult.parse(
-                result.structuredContent ?? JSON.parse(text?.text ?? 'null')
-            )
-
-            return data.results.slice(0, limit).map((item) => ({
-                url: item.url,
-                title: item.title || item.url,
-                description: item.excerpts.join('\n\n')
-            }))
-        } finally {
-            await client.close()
+        if (!response.ok) {
+            throw new Error(`HTTP error ${response.status}: ${body}`)
         }
+
+        const message = response.headers
+            .get('content-type')
+            ?.includes('text/event-stream')
+            ? body
+                  .split('\n')
+                  .filter((line) => line.startsWith('data:'))
+                  .map((line) => JSON.parse(line.slice(5)) as JsonRpcResponse)
+                  .find((it) => it.id === 1)
+            : (JSON.parse(body) as JsonRpcResponse)
+
+        if (message?.error) {
+            throw new Error(
+                `Parallel web_search failed: ${message.error.message}`
+            )
+        }
+
+        if (!message?.result || message.result.isError) {
+            throw new Error('Parallel web_search failed')
+        }
+
+        const text = message.result.content.find(
+            (block) => block.type === 'text'
+        )
+        const data = searchResult.parse(
+            message.result.structuredContent ?? JSON.parse(text?.text ?? 'null')
+        )
+
+        return data.results.slice(0, limit).map((item) => ({
+            url: item.url,
+            title: item.title || item.url,
+            description: item.excerpts.join('\n\n')
+        }))
     }
 }
 
